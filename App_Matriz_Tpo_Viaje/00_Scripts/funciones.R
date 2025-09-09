@@ -36,7 +36,7 @@ function(puntos_input) {
         )
     
 }
-# funciones.R
+# funciones.R  ## Cambios en esta funcion
 calcular_ruta <- function(lon_o, lat_o, lon_d, lat_d,
                           api_key,
                           profile  = "driving-car",

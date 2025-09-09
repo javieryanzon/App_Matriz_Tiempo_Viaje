@@ -31,7 +31,7 @@ library(leaflet.extras)
 #library(progress)
 
 
-source("../00_Scripts/funciones.R")  # carga leer_puntos() y calcular_ruta()
+source("00_Scripts/funciones.R")  # carga leer_puntos() y calcular_ruta()
 
 # UI ----
 
