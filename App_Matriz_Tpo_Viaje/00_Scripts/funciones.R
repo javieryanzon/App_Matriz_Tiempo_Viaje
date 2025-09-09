@@ -36,25 +36,51 @@ function(puntos_input) {
         )
     
 }
-calcular_ruta <-
-function(lon_o, lat_o, lon_d, lat_d) {
-    tryCatch({
-        ruta <- ors_directions(
-            coordinates = list(c(lon_o, lat_o), c(lon_d, lat_d)),
-            profile = "driving-car",
-            output = "parsed"
+# funciones.R
+calcular_ruta <- function(lon_o, lat_o, lon_d, lat_d,
+                          api_key,
+                          profile  = "driving-car",
+                          retries  = 1,          # nº de reintentos si falla la request
+                          backoff  = 1) {        # segundos de espera incremental
+    for (att in 0:retries) {
+        res <- tryCatch(
+            openrouteservice::ors_directions(
+                coordinates = list(c(lon_o, lat_o), c(lon_d, lat_d)),
+                profile     = profile,
+                output      = "parsed",
+                api_key     = api_key   # <-- clave va aquí
+            ),
+            error = function(e) e
         )
-        resumen <- ruta$features[[1]]$properties$summary
         
-        list(
-            distancia_km = resumen$distance / 1000,
-            duracion_min = resumen$duration / 60
-        )
-    }, error = function(e) {
-        message("Error entre (", lon_o, ",", lat_o, ") y (", lon_d, ",", lat_d, "): ", e$message)
-        list(
-            distancia_km = NA_real_,
-            duracion_min = NA_real_
-        )
-    })
+        # Éxito
+        if (!inherits(res, "error")) {
+            sumry <- tryCatch(res$features[[1]]$properties$summary, error = function(e) NULL)
+            if (!is.null(sumry)) {
+                return(list(
+                    distancia_km = as.numeric(sumry$distance) / 1000,
+                    duracion_min = as.numeric(sumry$duration) / 60
+                ))
+            } else {
+                return(list(distancia_km = NA_real_, duracion_min = NA_real_))
+            }
+        }
+        
+        # Error: decide si reintenta
+        msg <- conditionMessage(res)
+        if (att < retries && grepl("\\b(429|5\\d\\d)\\b", msg)) {
+            Sys.sleep(backoff * (att + 1))  # backoff simple
+            next
+        }
+        if (grepl("\\[403\\]", msg)) {
+            message("ORS 403 (sin permiso o key incorrecta) para directions: ", msg)
+        } else {
+            message(sprintf(
+                "Error entre (%.6f,%.6f) y (%.6f,%.6f): %s",
+                lon_o, lat_o, lon_d, lat_d, msg
+            ))
+        }
+        return(list(distancia_km = NA_real_, duracion_min = NA_real_))
+    }
 }
+

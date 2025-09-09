@@ -28,10 +28,10 @@ library(leaflet)
 library(leaflet.extras)
 
 # Progreso en consola
-library(progress)
+#library(progress)
 
 
-source("00_Scripts/funciones.R")  # carga leer_puntos() y calcular_ruta()
+source("../00_Scripts/funciones.R")  # carga leer_puntos() y calcular_ruta()
 
 # UI ----
 
@@ -105,7 +105,7 @@ ui <- fluidPage(
             width = 6,
             wellPanel(style="margin-top: 20px",
                 div(h4("Heatmap Distancia (km)"),
-                    plotOutput("heatmap_distancia", height = "420px"),
+                    plotOutput("heatmap_distancia", height = "560px"),
                     downloadButton("download_distancia", "Descargar matriz distancia (Excel)"),
                     ),
                     )
@@ -114,7 +114,7 @@ ui <- fluidPage(
                 width = 6,
                 wellPanel(style="margin-top: 20px",
                         div(h4("Heatmap Duración (min)"),
-                            plotOutput("heatmap_duracion", height = "420px"),
+                            plotOutput("heatmap_duracion", height = "560px"),
                             downloadButton("download_duracion", "Descargar matriz duración (Excel)")
                         )
             )
@@ -180,83 +180,169 @@ server <- function(input, output, session) {
     # Cálculo de rutas y matrices
     observeEvent(input$go, {
         req(input$api_key)
-        ors_api_key(input$api_key)  # fija la key para openrouteservice
+        key <- isolate(input$api_key)
+        
+        # Muestra solo prefijo/sufijo para comprobar que es la esperada
+        output$status <- renderText(sprintf("Usando API key %s…%s",
+                                            substr(key, 1, 4), substr(key, nchar(key)-3, nchar(key))))
         
         pts <- puntos()
-        output$status <- renderText("Iniciando cálculo de rutas...")
-        
-        # Generar combinaciones origen-destino
-        combos <- expand_grid(origen = pts, destino = pts) %>%
-            transmute(
-                nombre_o = origen$nombre, lon_o = origen$lon, lat_o = origen$lat,
-                nombre_d = destino$nombre, lon_d = destino$lon, lat_d = destino$lat
-            )
-        
-        # Índices no self
-        idx_no_self <- which(combos$nombre_o != combos$nombre_d)
-        
-        # Barra de progreso en UI
-        prog <- Progress$new(session, min = 0, max = length(idx_no_self))
-        on.exit(prog$close(), add = TRUE)
-        prog$set(message = "Calculando rutas", value = 0)
-        
-        # Resultados por combinación (self=0)
-        combos$resultado <- vector("list", nrow(combos))
-        zero_res <- list(distancia_km = 0, duracion_min = 0)
-        combos$resultado[combos$nombre_o == combos$nombre_d] <- list(zero_res)
-        
-        # Calcular solo no-self
-        for (i in seq_along(idx_no_self)) {
-            rowi <- idx_no_self[i]
-            combos$resultado[[rowi]] <- calcular_ruta(
-                combos$lon_o[rowi], combos$lat_o[rowi],
-                combos$lon_d[rowi], combos$lat_d[rowi]
-            )
-            prog$inc(1)
+        if (nrow(pts) > 40) {
+            showNotification("Por ahora sube hasta 40 puntos.", type = "warning", duration = 6)
+            output$status <- renderText("⚠️ Demasiados puntos: máximo 40.")
+            return(invisible(NULL))
         }
         
-        # Extraer resultados largos
-        resultados <- combos %>%
-            mutate(
-                distancia_km = map_dbl(resultado, ~pluck(.x, "distancia_km", .default = NA_real_)),
-                duracion_min = map_dbl(resultado, ~pluck(.x, "duracion_min",  .default = NA_real_))
-            ) %>%
-            select(nombre_o, nombre_d, distancia_km, duracion_min)
+        output$status <- renderText("Iniciando cálculo…")
         
-        # Guardar resultados
-        resultados_rv(resultados)
-        
-        # Orden deseado = orden de aparición en 'puntos()'
-        orden <- puntos()$nombre
-        
-        # Matrices (data.frame) en orden
-        wide_dist <- resultados %>%
-            pivot_wider(id_cols = nombre_o, names_from = nombre_d, values_from = distancia_km)
-        mat_dist  <- as.data.frame(wide_dist)
-        rownames(mat_dist) <- mat_dist$nombre_o
-        mat_dist$nombre_o  <- NULL
-        mat_dist  <- mat_dist[orden, orden, drop = FALSE]
-        
-        wide_dur  <- resultados %>%
-            pivot_wider(id_cols = nombre_o, names_from = nombre_d, values_from = duracion_min)
-        mat_dur   <- as.data.frame(wide_dur)
-        rownames(mat_dur) <- mat_dur$nombre_o
-        mat_dur$nombre_o  <- NULL
-        mat_dur   <- mat_dur[orden, orden, drop = FALSE]
-        
-        mat_dist_rv(mat_dist)
-        mat_dur_rv(mat_dur)
+        withProgress(message = "Calculando", value = 0, {
+            coords <- purrr::pmap(pts[, c("lon","lat")], c)
+            
+            # 1) Intento con MATRIX (una sola request)
+            incProgress(0.2, detail = "ORS Matrix")
+            res <- tryCatch(
+                openrouteservice::ors_matrix(
+                    locations = coords,
+                    profile   = "driving-car",           # o "foot-walking"
+                    metrics   = c("distance","duration"),
+                    api_key   = key
+                    # , timeout = 60
+                ),
+                error = identity
+            )
+            
+            if (inherits(res, "error") && grepl("\\[403\\]", conditionMessage(res))) {
+                # 2) Fallback OD→OD si el servidor responde 403 (key sin permiso o mal leída)
+                showNotification("Tu key devolvió 403 en 'Matrix'. Uso fallback punto a punto (más lento).",
+                                 type = "warning", duration = 8)
+                
+                n <- nrow(pts)
+                mat_dist <- matrix(NA_real_, n, n, dimnames = list(pts$nombre, pts$nombre))
+                mat_dur  <- matrix(NA_real_, n, n, dimnames = list(pts$nombre, pts$nombre))
+                diag(mat_dist) <- 0; diag(mat_dur) <- 0
+                
+                total <- n*(n-1)
+                done  <- 0
+                incProgress(0.2, detail = "Calculando rutas OD")
+                for (i in seq_len(n)) {
+                    for (j in seq_len(n)) {
+                        if (i == j) next
+                        done <- done + 1
+                        incProgress(0.6/total, detail = sprintf("%s → %s", pts$nombre[i], pts$nombre[j]))
+                        
+                        ans <- calcular_ruta(
+                            pts$lon[i], pts$lat[i], pts$lon[j], pts$lat[j],
+                            api_key = key   # <- asegúrate de que tu función lo acepte y lo pase a ors_directions()
+                        )
+                        mat_dist[i, j] <- ans$distancia_km
+                        mat_dur[i, j]  <- ans$duracion_min
+                    }
+                }
+                
+                mat_dist_rv(mat_dist)
+                mat_dur_rv(mat_dur)
+                
+                # largo para gráficos
+                ij <- expand.grid(i = seq_len(n), j = seq_len(n))
+                resultados_rv(tibble::tibble(
+                    nombre_o     = pts$nombre[ij$i],
+                    nombre_d     = pts$nombre[ij$j],
+                    distancia_km = mat_dist[cbind(ij$i, ij$j)],
+                    duracion_min = mat_dur[cbind(ij$i, ij$j)]
+                ))
+                
+            } else if (inherits(res, "error")) {
+                # Cualquier otro error distinto de 403
+                msg <- paste("❌ Error ORS:", conditionMessage(res))
+                showNotification(msg, type = "error", duration = 8)
+                output$status <- renderText(msg)
+                return(invisible(NULL))
+            } else {
+                # 3) OK con MATRIX → parseo
+                incProgress(0.7, detail = "Procesando matrices")
+                
+                to_matrix <- function(x, n) {
+                    if (is.null(x)) return(matrix(NA_real_, n, n))
+                    if (is.list(x)) do.call(rbind, x) else as.matrix(x)
+                }
+                
+                n <- nrow(pts)
+                mat_dist <- to_matrix(res$distances, n) / 1000  # m -> km
+                mat_dur  <- to_matrix(res$durations, n) / 60    # s -> min
+                
+                rownames(mat_dist) <- colnames(mat_dist) <- pts$nombre
+                rownames(mat_dur)  <- colnames(mat_dur)  <- pts$nombre
+                
+                mat_dist_rv(mat_dist)
+                mat_dur_rv(mat_dur)
+                
+                ij <- expand.grid(i = seq_len(n), j = seq_len(n))
+                resultados_rv(tibble::tibble(
+                    nombre_o     = pts$nombre[ij$i],
+                    nombre_d     = pts$nombre[ij$j],
+                    distancia_km = mat_dist[cbind(ij$i, ij$j)],
+                    duracion_min = mat_dur[cbind(ij$i, ij$j)]
+                ))
+            }
+            
+            incProgress(1, detail = "Listo")
+        })
         
         output$status <- renderText("✅ Cálculo completado.")
     })
     
+    
     # Heatmap DISTANCIA (ggplot)
+    # output$heatmap_distancia <- renderPlot({
+    #     req(resultados_rv())
+    #     res   <- resultados_rv()
+    #     orden <- puntos()$nombre
+    #     mid   <- median(res$distancia_km, na.rm = TRUE)
+    #     
+    #     long_dist <- res %>%
+    #         mutate(
+    #             nombre_o = factor(nombre_o, levels = orden),
+    #             nombre_d = factor(nombre_d, levels = orden),
+    #             label_txt = if_else(is.na(distancia_km), "", sprintf("%.2f", distancia_km)),
+    #             txt_col   = case_when(
+    #                 is.na(distancia_km) ~ "#9aa0a6",      # gris para NA
+    #                 distancia_km >= mid ~ "#FFFFFF",      # fondo más oscuro → texto blanco
+    #                 TRUE                ~ "#111111"       # fondo claro → texto negro
+    #             )
+    #         )
+    #     
+    #     ggplot(long_dist, aes(x = nombre_d, y = nombre_o, fill = distancia_km)) +
+    #         geom_tile() +
+    #         geom_text(aes(label = label_txt, color = txt_col),
+    #                   size = 3, fontface = "bold", na.rm = FALSE) +
+    #         scale_color_identity() +
+    #         scale_x_discrete(limits = orden) +
+    #         scale_y_discrete(limits = rev(orden)) +  # PUNTO_1 arriba
+    #         # Paleta amigable con darkly (probá también option = "inferno" o "magma")
+    #         scale_fill_viridis_c(option = "inferno", direction = 1,
+    #                              na.value = "#2f3a44") +
+    #         coord_equal() +
+    #         labs(x = "Destino", y = "Origen", fill = "km") +
+    #         theme_minimal(base_size = 12) +
+    #         theme(
+    #             plot.background   = element_rect(fill = "transparent", color = NA),
+    #             panel.background  = element_rect(fill = "#2b2b2b", color = NA),
+    #             panel.grid.major  = element_line(color = "#3d4852"),
+    #             panel.grid.minor  = element_blank(),
+    #             axis.text         = element_text(color = "#e0e0e0"),
+    #             axis.title        = element_text(color = "#e0e0e0"),
+    #             legend.text       = element_text(color = "#e0e0e0"),
+    #             legend.title      = element_text(color = "#e0e0e0"),
+    #             axis.text.x       = element_text(angle = 45, hjust = 1)
+    #         )
+    # })
+    
     output$heatmap_distancia <- renderPlot({
         req(resultados_rv())
         res <- resultados_rv()
         orden <- puntos()$nombre
         mid <- median(res$distancia_km, na.rm = TRUE)
-        
+
         long_dist <- res %>%
             mutate(
                 nombre_o = factor(nombre_o, levels = orden),
@@ -268,7 +354,7 @@ server <- function(input, output, session) {
                     TRUE ~ "#000000"
                 )
             )
-        
+
         ggplot(long_dist, aes(x = nombre_d, y = nombre_o, fill = distancia_km)) +
             geom_tile(na.rm = FALSE) +
             geom_text(aes(label = label_txt, color = txt_col), size = 3, fontface = "bold", na.rm = FALSE) +
@@ -283,12 +369,56 @@ server <- function(input, output, session) {
     })
     
     # Heatmap DURACIÓN (ggplot)
+    # output$heatmap_duracion <- renderPlot({
+    #     req(resultados_rv())
+    #     res   <- resultados_rv()
+    #     orden <- puntos()$nombre
+    #     mid   <- median(res$duracion_min, na.rm = TRUE)
+    #     
+    #     long_dur <- res %>%
+    #         mutate(
+    #             nombre_o = factor(nombre_o, levels = orden),
+    #             nombre_d = factor(nombre_d, levels = orden),
+    #             label_txt = if_else(is.na(duracion_min), "", sprintf("%.2f", duracion_min)),
+    #             txt_col   = case_when(
+    #                 is.na(duracion_min) ~ "#9aa0a6",
+    #                 duracion_min >= mid ~ "#FFFFFF",
+    #                 TRUE                ~ "#111111"
+    #             )
+    #         )
+    #     
+    #     ggplot(long_dur, aes(x = nombre_d, y = nombre_o, fill = duracion_min)) +
+    #         geom_tile() +
+    #         geom_text(aes(label = label_txt, color = txt_col),
+    #                   size = 3, fontface = "bold", na.rm = FALSE) +
+    #         scale_color_identity() +
+    #         scale_x_discrete(limits = orden) +
+    #         scale_y_discrete(limits = rev(orden)) +
+    #         scale_fill_viridis_c(option = "inferno", direction = 1,
+    #                              na.value = "#2f3a44") +
+    #         coord_equal() +
+    #         labs(x = "Destino", y = "Origen", fill = "min") +
+    #         theme_minimal(base_size = 12) +
+    #         theme(
+    #             plot.background   = element_rect(fill = "transparent", color = NA),
+    #             panel.background  = element_rect(fill = "#2b2b2b", color = NA),
+    #             panel.grid.major  = element_line(color = "#3d4852"),
+    #             panel.grid.minor  = element_blank(),
+    #             axis.text         = element_text(color = "#e0e0e0"),
+    #             axis.title        = element_text(color = "#e0e0e0"),
+    #             legend.text       = element_text(color = "#e0e0e0"),
+    #             legend.title      = element_text(color = "#e0e0e0"),
+    #             axis.text.x       = element_text(angle = 45, hjust = 1)
+    #         )
+    # })
+    
+    
     output$heatmap_duracion <- renderPlot({
         req(resultados_rv())
         res <- resultados_rv()
         orden <- puntos()$nombre
         mid <- median(res$duracion_min, na.rm = TRUE)
-        
+
         long_dur <- res %>%
             mutate(
                 nombre_o = factor(nombre_o, levels = orden),
@@ -300,7 +430,7 @@ server <- function(input, output, session) {
                     TRUE ~ "#000000"
                 )
             )
-        
+
         ggplot(long_dur, aes(x = nombre_d, y = nombre_o, fill = duracion_min)) +
             geom_tile(na.rm = FALSE) +
             geom_text(aes(label = label_txt, color = txt_col), size = 3, fontface = "bold", na.rm = FALSE) +
