@@ -45,20 +45,25 @@ ui <- fluidPage(
     div(
         class = "container",
         id = "header",
-        h1("Cálculo de tiempos de viaje", tags$small((tags$cite(title = "Javier Yanzón", "(@javieryanzon - ",
+        h1("Cálculo de tiempos de viaje", style="margin-bottom: 0;"), 
+        
+    div(
+        class = "sublinks",
+        tags$small((tags$cite(title = "Javier Yanzón", "(@javieryanzon - ",
                                                                 a(href = "https://x.com/javieryanzon" , "X", target = "_blank"),
                                                                 " - ", 
                                                                 a(href = "https://linkedin.com/in/javieryanzon" , "Likedin", target = "_blank"), 
                                                                 " - ", 
                                                                 a(href = "https://github.com/javieryanzon" , "Github", target = "_blank"),
                                                                   ")")))),
-        p(
-          "Proyecto Shiny:", 
-          "obtiene la matriz de distancia y tiempos de viajes de los puntos indicados.",
-          "Para ello es necesario crear una API key muy fácilmente en la siguiente url:",
+    br(),
+    p(
+        tags$strong("Esta app obtiene la matriz de distancia y tiempos de viajes de los puntos indicados."),
+          "Para ello es necesario crear una API key en la siguiente url:",
           a(href = "https://account.heigit.org/login?redirect=https:%2F%2Fopenrouteservice.org%2Fdev%2F%23%2Fapi-docs",
             "openrouteservice API docs", target = "_blank")
-          )
+          ),
+    br()
     ),
     
     
